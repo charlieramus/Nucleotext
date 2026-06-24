@@ -1,0 +1,24 @@
+# --- Node / build ---
+node_modules/
+main.js
+*.js.map
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+
+# --- Planning artifacts: update logs (any version / separator / case) ---
+# Catches UPDATELOGV1.md, UPDATELOGV2, UPDATE_LOG_V3, updatelog4.md, etc.
+UPDATELOG*
+UPDATE_LOG*
+updatelog*
+update_log*
+
+# --- gstack Claude Code skill suite working artifacts ---
+# None present in the repo today; ignored defensively so future runs of the
+# gstack skills do not leak working directories or caches into git.
+.gstack/
+.browse/
+.gbrain/
+gbrain/

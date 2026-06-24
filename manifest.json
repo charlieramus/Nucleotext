@@ -1,0 +1,9 @@
+{
+	"id": "nucleotext",
+	"name": "Nucleotext",
+	"version": "0.1.0",
+	"minAppVersion": "1.5.0",
+	"description": "Encode your vault's notes into constrained DNA nucleotide sequences that respect real synthesis limits.",
+	"author": "Charlie Ramus",
+	"isDesktopOnly": false
+}
