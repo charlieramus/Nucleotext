@@ -404,6 +404,34 @@ export default class NucleotextPlugin extends Plugin {
 		.nucleotext-browser-scroll { flex: 1 1 auto; overflow: auto; min-height: 0;
 			position: relative; }
 		.nucleotext-browser-canvas { display: block; }
+		.nucleotext-browser-controls { display: flex; flex-wrap: wrap;
+			align-items: center; gap: 12px; padding: 0 12px 6px; flex: 0 0 auto; }
+		.nucleotext-browser-group { display: flex; align-items: center; gap: 4px; }
+		.nucleotext-browser-btn { background: var(--background-modifier-form-field);
+			border: 1px solid var(--background-modifier-border); border-radius: 4px;
+			color: var(--text-normal); cursor: pointer; font-size: var(--font-ui-small);
+			line-height: 1; min-width: 26px; padding: 4px 8px; }
+		.nucleotext-browser-btn:hover { background: var(--background-modifier-hover); }
+		.nucleotext-browser-zoom { color: var(--text-muted);
+			font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums;
+			min-width: 34px; text-align: center; }
+		.nucleotext-browser-hint { color: var(--text-faint);
+			font-size: var(--font-ui-smaller); margin-left: 4px; }
+		.nucleotext-browser-modes { display: inline-flex;
+			border: 1px solid var(--background-modifier-border); border-radius: 4px;
+			overflow: hidden; }
+		.nucleotext-browser-mode { background: transparent; border: none;
+			color: var(--text-muted); cursor: pointer; font-size: var(--font-ui-small);
+			padding: 4px 10px; }
+		.nucleotext-browser-mode:hover { background: var(--background-modifier-hover); }
+		.nucleotext-browser-mode.is-active { background: var(--interactive-accent);
+			color: var(--text-on-accent); }
+		.nucleotext-browser-legend { padding: 0 12px 8px; flex: 0 0 auto; }
+		.nucleotext-browser-legend-bar { height: 8px; border-radius: 4px;
+			border: 1px solid var(--background-modifier-border); }
+		.nucleotext-browser-legend-labels { display: flex;
+			justify-content: space-between; color: var(--text-faint);
+			font-size: var(--font-ui-smaller); margin-top: 2px; }
 		`;
 		const el = document.createElement("style");
 		el.id = "nucleotext-health-styles";
