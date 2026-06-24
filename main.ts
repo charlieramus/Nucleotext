@@ -23,13 +23,20 @@ import { decode, encode } from "./src/codec";
 import { buildGenome, Genome } from "./src/genome";
 import { genomeToFasta } from "./src/fasta";
 import { GenomeHealthView, GENOME_HEALTH_VIEW } from "./src/healthPanel";
-import { SnapshotManager, SnapshotMap } from "./src/snapshots";
+import { NoteSnapshot, SnapshotManager, SnapshotMap } from "./src/snapshots";
+import { diffSequences } from "./src/diff";
+import { classifyRegions, summarizeMutations } from "./src/classify";
+import { MutationLog, MutationLogData } from "./src/mutationLog";
+import { MutationLogView, MUTATION_LOG_VIEW } from "./src/mutationPanel";
+import { GenomeBrowserView, GENOME_BROWSER_VIEW } from "./src/genomeBrowser";
 
 interface NucleotextData {
 	settings: NucleotextSettings;
 	mapping: HuffmanMapping | null;
 	/** Stage 1 (mutation tracker): per-note before/after encoded-sequence snapshots. */
 	snapshots: SnapshotMap;
+	/** Stage 4/5 (mutation tracker): durable per-note mutation history. */
+	mutations: MutationLogData;
 }
 
 /** require() a module without throwing if it (or require itself) is absent. */
@@ -53,6 +60,10 @@ export default class NucleotextPlugin extends Plugin {
 	snapshots: SnapshotManager;
 	/** Loaded snapshot map, kept until the manager is constructed in onload. */
 	private loadedSnapshots: SnapshotMap = {};
+	/** Stage 4/5 (mutation tracker): durable per-note mutation history. */
+	mutationLog: MutationLog;
+	/** Loaded mutation history, kept until the log is constructed in onload. */
+	private loadedMutations: MutationLogData | null = null;
 	/** Debounce handle for persisting the snapshot store. */
 	private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -63,15 +74,29 @@ export default class NucleotextPlugin extends Plugin {
 		this.addSettingTab(new NucleotextSettingTab(this.app, this));
 		this.injectStyles();
 
+		// Stage 4/5: durable mutation history. Built before the snapshot manager
+		// so save-driven captures can record into it immediately.
+		this.mutationLog = new MutationLog(this.loadedMutations);
+
 		// Stage 1 (mutation tracker): snapshot store fed by note save events.
+		// Stage 3/4: each genuine change is diffed, classified and logged.
 		this.snapshots = new SnapshotManager(
 			{
 				encode: (path) => this.encodeForSnapshot(path),
 				persist: () => this.schedulePersist(),
+				onChange: (snapshot) => this.recordMutations(snapshot),
 			},
 			this.loadedSnapshots
 		);
 		this.registerSnapshotEvents();
+
+		this.registerView(
+			MUTATION_LOG_VIEW,
+			(leaf) => new MutationLogView(leaf, this)
+		);
+		this.addRibbonIcon("git-compare", "Open mutation log", () =>
+			this.runCommand(() => this.activateMutationView())
+		);
 
 		this.registerView(
 			GENOME_HEALTH_VIEW,
@@ -79,6 +104,15 @@ export default class NucleotextPlugin extends Plugin {
 		);
 		this.addRibbonIcon("dna", "Open genome health panel", () =>
 			this.runCommand(() => this.activateHealthView())
+		);
+
+		// Log 4: linear genome browser (its own main-area view).
+		this.registerView(
+			GENOME_BROWSER_VIEW,
+			(leaf) => new GenomeBrowserView(leaf, this)
+		);
+		this.addRibbonIcon("microscope", "Open genome browser", () =>
+			this.runCommand(() => this.activateGenomeBrowserView())
 		);
 
 		this.addCommand({
@@ -120,6 +154,16 @@ export default class NucleotextPlugin extends Plugin {
 			id: "nucleotext-dump-snapshots",
 			name: "Dump snapshot store (debug)",
 			callback: () => this.runCommand(() => this.dumpSnapshots()),
+		});
+		this.addCommand({
+			id: "nucleotext-open-mutation-log",
+			name: "Open mutation log",
+			callback: () => this.runCommand(() => this.activateMutationView()),
+		});
+		this.addCommand({
+			id: "nucleotext-open-genome-browser",
+			name: "Open genome browser",
+			callback: () => this.runCommand(() => this.activateGenomeBrowserView()),
 		});
 	}
 
@@ -223,6 +267,59 @@ export default class NucleotextPlugin extends Plugin {
 		);
 	}
 
+	/**
+	 * Stages 2-4 pipeline: a snapshot just moved forward. Diff previous→current,
+	 * classify the regions, and log one event if there were any mutations.
+	 *
+	 * A brand-new note has `previous: null` (stage 1) — there's no earlier version
+	 * to diff against, so it isn't an "edit event" and nothing is logged. A change
+	 * that produces zero mutations is never logged either (record() guards on it),
+	 * so no-op saves can't clutter the history.
+	 */
+	private recordMutations(snapshot: NoteSnapshot): void {
+		if (snapshot.previous === null) return;
+		const regions = diffSequences(snapshot.previous, snapshot.current);
+		const counts = summarizeMutations(classifyRegions(regions));
+		if (counts.total === 0) return;
+		const basename = snapshot.path.replace(/\.md$/i, "").split("/").pop() ?? snapshot.path;
+		this.mutationLog.record(snapshot.path, basename, counts, snapshot.currentAt);
+		this.schedulePersist();
+	}
+
+	/** Stage 5: clear one note's history (called from the panel after confirmation). */
+	async clearNoteHistory(path: string): Promise<void> {
+		const removed = this.mutationLog.clearNote(path);
+		if (removed > 0) {
+			await this.flushSnapshots();
+			new Notice(`Nucleotext: cleared ${removed} mutation event(s) for that note.`);
+		}
+	}
+
+	/** Stage 5: clear the entire vault's history (called from the panel after confirmation). */
+	async clearAllHistory(): Promise<void> {
+		const removed = this.mutationLog.clearAll();
+		if (removed > 0) {
+			await this.flushSnapshots();
+			new Notice(`Nucleotext: cleared all ${removed} mutation event(s) for the vault.`);
+		}
+	}
+
+	/** Open (or reveal) the mutation log panel in the right sidebar. */
+	private async activateMutationView(): Promise<void> {
+		const { workspace } = this.app;
+		let leaf = workspace.getLeavesOfType(MUTATION_LOG_VIEW)[0];
+		if (!leaf) {
+			const right = workspace.getRightLeaf(false);
+			if (!right) {
+				new Notice("Nucleotext: could not open a sidebar panel.");
+				return;
+			}
+			leaf = right;
+			await leaf.setViewState({ type: MUTATION_LOG_VIEW, active: true });
+		}
+		workspace.revealLeaf(leaf);
+	}
+
 	/** Minimal styling for the health panel (stage 5: readable, not polished). */
 	private injectStyles(): void {
 		const css = `
@@ -251,6 +348,62 @@ export default class NucleotextPlugin extends Plugin {
 		.nucleotext-health-table th.is-sorted { color: var(--text-accent); }
 		.nucleotext-health-table tbody tr:hover { background: var(--background-modifier-hover); }
 		.nucleotext-health-default { color: var(--text-faint); }
+
+		/* Stage 4/5: mutation log panel */
+		.nucleotext-mut { padding: 0 4px; }
+		.nucleotext-mut-head { display: flex; align-items: center;
+			justify-content: space-between; gap: 8px; }
+		.nucleotext-mut-head h3 { margin: 8px 0; }
+		.nucleotext-mut-clearall { color: var(--text-error); background: transparent;
+			border: 1px solid var(--background-modifier-border); border-radius: 4px;
+			cursor: pointer; font-size: var(--font-ui-smaller); padding: 2px 8px; }
+		.nucleotext-mut-clearall:hover { background: var(--background-modifier-error-hover);
+			border-color: var(--text-error); }
+		.nucleotext-mut-summary { color: var(--text-muted);
+			font-size: var(--font-ui-small); margin-bottom: 6px; }
+		.nucleotext-mut-empty { color: var(--text-muted);
+			font-size: var(--font-ui-small); padding: 8px 2px; }
+		.nucleotext-mut-note { border-bottom: 1px solid var(--background-modifier-border);
+			padding: 2px 0; }
+		.nucleotext-mut-note-head { display: flex; align-items: center; gap: 6px;
+			cursor: pointer; padding: 4px 2px; }
+		.nucleotext-mut-note-head:hover { background: var(--background-modifier-hover); }
+		.nucleotext-mut-caret { display: inline-flex; color: var(--text-muted); }
+		.nucleotext-mut-note-title { flex: 1; min-width: 0; }
+		.nucleotext-mut-note-name { font-weight: var(--font-semibold);
+			display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.nucleotext-mut-note-meta { color: var(--text-muted);
+			font-size: var(--font-ui-smaller); }
+		.nucleotext-mut-clear { color: var(--text-muted); background: transparent;
+			border: none; cursor: pointer; font-size: var(--font-ui-smaller); padding: 2px 6px; }
+		.nucleotext-mut-clear:hover { color: var(--text-error); }
+		.nucleotext-mut-events { padding: 2px 0 4px 22px; }
+		.nucleotext-mut-event { display: flex; gap: 8px; align-items: baseline;
+			font-size: var(--font-ui-small); padding: 1px 0; }
+		.nucleotext-mut-time { color: var(--text-faint);
+			font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums;
+			white-space: nowrap; }
+		.nucleotext-mut-counts { color: var(--text-normal); }
+		.nucleotext-mut-more { margin: 2px 0 6px 22px; background: transparent;
+			border: none; color: var(--text-accent); cursor: pointer;
+			font-size: var(--font-ui-smaller); padding: 2px 0; }
+		.nucleotext-mut-modal-buttons { display: flex; justify-content: flex-end;
+			gap: 8px; margin-top: 16px; }
+
+		/* Log 4: genome browser */
+		.nucleotext-browser { display: flex; flex-direction: column; height: 100%;
+			padding: 0; }
+		.nucleotext-browser-head { display: flex; align-items: center;
+			justify-content: space-between; gap: 8px; padding: 0 12px;
+			flex: 0 0 auto; }
+		.nucleotext-browser-head h3 { margin: 8px 0; }
+		.nucleotext-browser-refresh { display: inline-flex; align-items: center;
+			background: transparent; border: none; cursor: pointer;
+			color: var(--text-muted); padding: 4px; }
+		.nucleotext-browser-refresh:hover { color: var(--text-normal); }
+		.nucleotext-browser-scroll { flex: 1 1 auto; overflow: auto; min-height: 0;
+			position: relative; }
+		.nucleotext-browser-canvas { display: block; }
 		`;
 		const el = document.createElement("style");
 		el.id = "nucleotext-health-styles";
@@ -648,6 +801,21 @@ export default class NucleotextPlugin extends Plugin {
 	}
 
 	/**
+	 * Open (or reveal) the genome browser in a main-area pane (log 4). Reuses the
+	 * existing leaf if one is already open so repeated triggers don't stack up
+	 * duplicate panes.
+	 */
+	private async activateGenomeBrowserView(): Promise<void> {
+		const { workspace } = this.app;
+		let leaf = workspace.getLeavesOfType(GENOME_BROWSER_VIEW)[0];
+		if (!leaf) {
+			leaf = workspace.getLeaf(true);
+			await leaf.setViewState({ type: GENOME_BROWSER_VIEW, active: true });
+		}
+		workspace.revealLeaf(leaf);
+	}
+
+	/**
 	 * Return a fresh genome, building it if needed. Requires an encoder mapping;
 	 * if none exists it tells the user to build one and returns null.
 	 * When `force` is true the genome is always rebuilt (used by the build
@@ -752,6 +920,7 @@ export default class NucleotextPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, raw?.settings);
 		this.mapping = raw?.mapping ?? null;
 		this.loadedSnapshots = raw?.snapshots ?? {};
+		this.loadedMutations = raw?.mutations ?? null;
 	}
 
 	private async saveData_(): Promise<void> {
@@ -761,6 +930,8 @@ export default class NucleotextPlugin extends Plugin {
 			// Read straight from the manager once it exists so we persist the
 			// live store, not the stale copy loaded at startup.
 			snapshots: this.snapshots?.getMap() ?? this.loadedSnapshots,
+			mutations: this.mutationLog?.toData() ??
+				this.loadedMutations ?? { version: 1, events: [] },
 		};
 		await this.saveData(data);
 	}

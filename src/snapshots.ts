@@ -130,6 +130,12 @@ export interface SnapshotDeps {
 	encode(path: string): Promise<string | null>;
 	/** Request that the (possibly debounced) persistence of the map happen. */
 	persist(): void;
+	/**
+	 * Optional: called after a capture that actually moved the store forward
+	 * (a brand-new note, or a genuine change). The mutation tracker uses this to
+	 * diff `previous`→`current` and log mutations. Not called for no-op saves.
+	 */
+	onChange?(snapshot: NoteSnapshot): void;
 }
 
 /**
@@ -203,6 +209,7 @@ export class SnapshotManager {
 		if (!changed) return;
 		this.map[path] = snapshot;
 		this.deps.persist();
+		this.deps.onChange?.(snapshot);
 	}
 
 	/**
