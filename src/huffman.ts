@@ -4,6 +4,23 @@ import { FrequencyTable } from "./frequency";
 export const BASES = ["A", "T", "C", "G"] as const;
 export type Base = (typeof BASES)[number];
 
+/** Base ↔ abstract quaternary digit, the bridge to the stage 5/6 transcoder. */
+export const BASE_OF_DIGIT: Base[] = ["A", "T", "C", "G"];
+export const DIGIT_OF_BASE: Record<string, number> = {
+	A: 0,
+	T: 1,
+	C: 2,
+	G: 3,
+};
+
+/** Thrown when a sequence cannot be decoded, or its mapping is missing/corrupt. */
+export class DecodeError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "DecodeError";
+	}
+}
+
 /** Bump when the mapping format changes so stale persisted maps are detectable. */
 export const MAPPING_VERSION = 1;
 
@@ -137,4 +154,83 @@ export function isPrefixFree(
 		}
 	}
 	return null;
+}
+
+/**
+ * Validate a persisted mapping before decoding. Throws a clear `DecodeError`
+ * for a missing, empty, malformed, version-mismatched, or non-prefix-free
+ * mapping — so a corrupt map fails loudly rather than returning garbage.
+ */
+export function validateMapping(
+	mapping: HuffmanMapping | null | undefined
+): asserts mapping is HuffmanMapping {
+	if (!mapping) {
+		throw new DecodeError("Mapping is missing.");
+	}
+	if (mapping.version !== MAPPING_VERSION) {
+		throw new DecodeError(
+			`Mapping version mismatch: got ${mapping.version}, expected ${MAPPING_VERSION}.`
+		);
+	}
+	if (!mapping.codes || typeof mapping.codes !== "object") {
+		throw new DecodeError("Mapping has no code table.");
+	}
+	const entries = Object.entries(mapping.codes);
+	if (entries.length === 0) {
+		throw new DecodeError("Mapping code table is empty.");
+	}
+	for (const [ch, code] of entries) {
+		if (typeof code !== "string" || code.length === 0 || !/^[ATCG]+$/.test(code)) {
+			throw new DecodeError(
+				`Corrupt code for ${JSON.stringify(ch)}: ${JSON.stringify(code)}.`
+			);
+		}
+	}
+	const conflict = isPrefixFree(mapping);
+	if (conflict) {
+		throw new DecodeError(
+			`Mapping is not prefix-free (${JSON.stringify(conflict.a)} vs ${JSON.stringify(
+				conflict.b
+			)}).`
+		);
+	}
+}
+
+/** Encode text into the abstract quaternary digit stream (0..3). */
+export function textToDigits(text: string, mapping: HuffmanMapping): number[] {
+	const codeStr = encodeText(text, mapping); // throws UnknownCharacterError
+	const digits: number[] = [];
+	for (const b of codeStr) digits.push(DIGIT_OF_BASE[b]);
+	return digits;
+}
+
+/**
+ * Prefix-decode a raw base-letter code stream back to text. Greedy matching is
+ * unambiguous because the codes are prefix-free. Throws `DecodeError` on an
+ * invalid base or an undecodable trailing fragment.
+ */
+export function decodeFromCodes(
+	codeStr: string,
+	mapping: HuffmanMapping
+): string {
+	const rev = new Map<string, string>();
+	for (const [ch, code] of Object.entries(mapping.codes)) rev.set(code, ch);
+
+	let out = "";
+	let buf = "";
+	for (const b of codeStr) {
+		if (DIGIT_OF_BASE[b] === undefined) {
+			throw new DecodeError(`Invalid base ${JSON.stringify(b)} in code stream.`);
+		}
+		buf += b;
+		const ch = rev.get(buf);
+		if (ch !== undefined) {
+			out += ch;
+			buf = "";
+		}
+	}
+	if (buf !== "") {
+		throw new DecodeError(`Trailing undecodable bases: ${JSON.stringify(buf)}.`);
+	}
+	return out;
 }
