@@ -23,10 +23,13 @@ import { decode, encode } from "./src/codec";
 import { buildGenome, Genome } from "./src/genome";
 import { genomeToFasta } from "./src/fasta";
 import { GenomeHealthView, GENOME_HEALTH_VIEW } from "./src/healthPanel";
+import { SnapshotManager, SnapshotMap } from "./src/snapshots";
 
 interface NucleotextData {
 	settings: NucleotextSettings;
 	mapping: HuffmanMapping | null;
+	/** Stage 1 (mutation tracker): per-note before/after encoded-sequence snapshots. */
+	snapshots: SnapshotMap;
 }
 
 /** require() a module without throwing if it (or require itself) is absent. */
@@ -46,6 +49,12 @@ export default class NucleotextPlugin extends Plugin {
 	genome: Genome | null = null;
 	/** Stage 5: injected stylesheet for the health panel; removed on unload. */
 	private styleEl: HTMLStyleElement | null = null;
+	/** Stage 1 (mutation tracker): before/after snapshot store, fed by save events. */
+	snapshots: SnapshotManager;
+	/** Loaded snapshot map, kept until the manager is constructed in onload. */
+	private loadedSnapshots: SnapshotMap = {};
+	/** Debounce handle for persisting the snapshot store. */
+	private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
 	async onload(): Promise<void> {
 		console.log("Nucleotext: loading plugin");
@@ -53,6 +62,16 @@ export default class NucleotextPlugin extends Plugin {
 		await this.loadData_();
 		this.addSettingTab(new NucleotextSettingTab(this.app, this));
 		this.injectStyles();
+
+		// Stage 1 (mutation tracker): snapshot store fed by note save events.
+		this.snapshots = new SnapshotManager(
+			{
+				encode: (path) => this.encodeForSnapshot(path),
+				persist: () => this.schedulePersist(),
+			},
+			this.loadedSnapshots
+		);
+		this.registerSnapshotEvents();
 
 		this.registerView(
 			GENOME_HEALTH_VIEW,
@@ -97,12 +116,111 @@ export default class NucleotextPlugin extends Plugin {
 			name: "Open genome health panel",
 			callback: () => this.runCommand(() => this.activateHealthView()),
 		});
+		this.addCommand({
+			id: "nucleotext-dump-snapshots",
+			name: "Dump snapshot store (debug)",
+			callback: () => this.runCommand(() => this.dumpSnapshots()),
+		});
 	}
 
 	onunload(): void {
 		console.log("Nucleotext: unloading plugin");
 		this.styleEl?.remove();
 		this.styleEl = null;
+		// Flush any pending snapshot writes so nothing captured just before a
+		// shutdown is lost (stage 1: snapshots must survive close/reopen).
+		void this.flushSnapshots();
+	}
+
+	/**
+	 * Stage 1 (mutation tracker): turn vault save/rename/delete signals into
+	 * snapshot updates. `registerEvent` ties the listeners to the plugin
+	 * lifecycle so they're cleaned up on unload.
+	 */
+	private registerSnapshotEvents(): void {
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (
+					file instanceof TFile &&
+					file.extension === "md" &&
+					!this.isExcluded(file)
+				) {
+					this.snapshots.onSave(file.path);
+				}
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (file instanceof TFile) {
+					this.snapshots.onRename(oldPath, file.path);
+				}
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile) this.snapshots.onDelete(file.path);
+			})
+		);
+	}
+
+	/**
+	 * Encode the note at `path` to its current constrained sequence for a
+	 * snapshot, or return null if it can't be encoded right now (no encoder,
+	 * excluded, missing, unreadable, or contains characters outside the encoder).
+	 * Returning null keeps the capture a safe no-op rather than corrupting the
+	 * store.
+	 */
+	private async encodeForSnapshot(path: string): Promise<string | null> {
+		if (!this.mapping) return null;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile) || this.isExcluded(file)) return null;
+		try {
+			const text = await this.app.vault.cachedRead(file);
+			return encode(text, this.mapping, this.constraints()).constrained;
+		} catch (e) {
+			// UnknownCharacterError, read failures, etc. — don't snapshot garbage.
+			console.warn(`Nucleotext: snapshot encode skipped for ${path}:`, e);
+			return null;
+		}
+	}
+
+	/** Debounced persistence of the snapshot store (and the rest of plugin data). */
+	private schedulePersist(): void {
+		if (this.persistTimer) clearTimeout(this.persistTimer);
+		this.persistTimer = setTimeout(() => {
+			this.persistTimer = null;
+			void this.saveData_();
+		}, 500);
+	}
+
+	/** Cancel any pending debounce and persist immediately. */
+	private async flushSnapshots(): Promise<void> {
+		if (this.persistTimer) {
+			clearTimeout(this.persistTimer);
+			this.persistTimer = null;
+		}
+		await this.saveData_();
+	}
+
+	/** Debug: write the snapshot store to a file and report its size. */
+	private async dumpSnapshots(): Promise<void> {
+		const map = this.snapshots.getMap();
+		const notes = Object.values(map);
+		await this.writeDebugFile("snapshots-debug.json", {
+			count: notes.length,
+			notes: notes.map((s) => ({
+				path: s.path,
+				isNew: s.isNew,
+				revisions: s.revisions,
+				currentLength: s.current.length,
+				previousLength: s.previous === null ? null : s.previous.length,
+				currentAt: s.currentAt,
+				previousAt: s.previousAt,
+			})),
+		});
+		new Notice(
+			`Nucleotext: ${notes.length} note snapshot(s) stored. See snapshots-debug.json.`
+		);
 	}
 
 	/** Minimal styling for the health panel (stage 5: readable, not polished). */
@@ -633,12 +751,16 @@ export default class NucleotextPlugin extends Plugin {
 		const raw = (await this.loadData()) as Partial<NucleotextData> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, raw?.settings);
 		this.mapping = raw?.mapping ?? null;
+		this.loadedSnapshots = raw?.snapshots ?? {};
 	}
 
 	private async saveData_(): Promise<void> {
 		const data: NucleotextData = {
 			settings: this.settings,
 			mapping: this.mapping,
+			// Read straight from the manager once it exists so we persist the
+			// live store, not the stale copy loaded at startup.
+			snapshots: this.snapshots?.getMap() ?? this.loadedSnapshots,
 		};
 		await this.saveData(data);
 	}
