@@ -20,21 +20,47 @@ import {
 	maxRunLength,
 } from "./src/transcode";
 import { decode, encode } from "./src/codec";
+import { buildGenome, Genome } from "./src/genome";
+import { genomeToFasta } from "./src/fasta";
+import { GenomeHealthView, GENOME_HEALTH_VIEW } from "./src/healthPanel";
 
 interface NucleotextData {
 	settings: NucleotextSettings;
 	mapping: HuffmanMapping | null;
 }
 
+/** require() a module without throwing if it (or require itself) is absent. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function safeRequire(req: ((id: string) => any) | undefined, id: string): any {
+	try {
+		return req?.(id);
+	} catch {
+		return undefined;
+	}
+}
+
 export default class NucleotextPlugin extends Plugin {
 	settings: NucleotextSettings;
 	mapping: HuffmanMapping | null = null;
+	/** Stage 1: in-memory vault genome, rebuilt on demand and read by later stages. */
+	genome: Genome | null = null;
+	/** Stage 5: injected stylesheet for the health panel; removed on unload. */
+	private styleEl: HTMLStyleElement | null = null;
 
 	async onload(): Promise<void> {
 		console.log("Nucleotext: loading plugin");
 
 		await this.loadData_();
 		this.addSettingTab(new NucleotextSettingTab(this.app, this));
+		this.injectStyles();
+
+		this.registerView(
+			GENOME_HEALTH_VIEW,
+			(leaf) => new GenomeHealthView(leaf, this)
+		);
+		this.addRibbonIcon("dna", "Open genome health panel", () =>
+			this.runCommand(() => this.activateHealthView())
+		);
 
 		this.addCommand({
 			id: "nucleotext-debug-frequency-table",
@@ -56,10 +82,63 @@ export default class NucleotextPlugin extends Plugin {
 			name: "Run roundtrip test on vault",
 			callback: () => this.runCommand(() => this.roundtripVault()),
 		});
+		this.addCommand({
+			id: "nucleotext-build-genome",
+			name: "Build genome (chromosomes, headers, GC)",
+			callback: () => this.runCommand(() => this.buildGenomeCommand()),
+		});
+		this.addCommand({
+			id: "nucleotext-export-fasta",
+			name: "Export genome as FASTA",
+			callback: () => this.runCommand(() => this.exportFasta()),
+		});
+		this.addCommand({
+			id: "nucleotext-open-health-panel",
+			name: "Open genome health panel",
+			callback: () => this.runCommand(() => this.activateHealthView()),
+		});
 	}
 
 	onunload(): void {
 		console.log("Nucleotext: unloading plugin");
+		this.styleEl?.remove();
+		this.styleEl = null;
+	}
+
+	/** Minimal styling for the health panel (stage 5: readable, not polished). */
+	private injectStyles(): void {
+		const css = `
+		.nucleotext-health { padding: 0 4px; }
+		.nucleotext-health-head { display: flex; align-items: center;
+			justify-content: space-between; gap: 8px; }
+		.nucleotext-health-head h3 { margin: 8px 0; }
+		.nucleotext-health-refresh { display: inline-flex; align-items: center;
+			background: transparent; border: none; cursor: pointer;
+			color: var(--text-muted); padding: 4px; }
+		.nucleotext-health-refresh:hover { color: var(--text-normal); }
+		.nucleotext-health-summary { color: var(--text-muted);
+			font-size: var(--font-ui-small); margin-bottom: 2px; }
+		.nucleotext-health-sortinfo { color: var(--text-faint);
+			font-size: var(--font-ui-smaller); margin-bottom: 8px; }
+		.nucleotext-health-empty, .nucleotext-health-note { color: var(--text-muted);
+			font-size: var(--font-ui-small); padding: 8px 2px; }
+		.nucleotext-health-table { width: 100%; border-collapse: collapse;
+			font-size: var(--font-ui-small); }
+		.nucleotext-health-table th, .nucleotext-health-table td {
+			padding: 4px 8px; border-bottom: 1px solid var(--background-modifier-border);
+			text-align: left; }
+		.nucleotext-health-table th.is-numeric, .nucleotext-health-table td.is-numeric {
+			text-align: right; font-variant-numeric: tabular-nums; }
+		.nucleotext-health-table th { user-select: none; color: var(--text-muted); }
+		.nucleotext-health-table th.is-sorted { color: var(--text-accent); }
+		.nucleotext-health-table tbody tr:hover { background: var(--background-modifier-hover); }
+		.nucleotext-health-default { color: var(--text-faint); }
+		`;
+		const el = document.createElement("style");
+		el.id = "nucleotext-health-styles";
+		el.textContent = css;
+		document.head.appendChild(el);
+		this.styleEl = el;
 	}
 
 	private async runCommand(body: () => Promise<void>): Promise<void> {
@@ -330,6 +409,194 @@ export default class NucleotextPlugin extends Plugin {
 				`${overLimit} over homopolymer limit, ` +
 				`corrupt-map rejected: ${corruptOk}. See console.`
 		);
+	}
+
+	// --- Stages 1-4: genome (chromosomes, headers, GC) ----------------------
+
+	/**
+	 * Build the in-memory genome and report it. Stages 1 (grouping), 2 (headers)
+	 * and 4 (GC) all land in `this.genome`, so the export and later panel can read
+	 * it without re-walking the vault.
+	 */
+	private async buildGenomeCommand(): Promise<void> {
+		const genome = await this.ensureGenome(true);
+		if (!genome) return;
+
+		const noteCount = genome.chromosomes.reduce(
+			(n, c) => n + c.notes.length,
+			0
+		);
+		console.log(
+			[
+				"Nucleotext genome",
+				`  chromosomes: ${genome.chromosomes.length}`,
+				`  notes:       ${noteCount}`,
+				`  total bases: ${genome.length}`,
+				`  genome GC:   ${genome.gcPercent}% (aggregate over all bases)`,
+				`  encode failures: ${genome.failures.length}`,
+				"  ----------------------------------------",
+				...genome.chromosomes.map(
+					(c) =>
+						`${c.name.padEnd(24).slice(0, 24)} ` +
+						`notes=${c.notes.length.toString().padStart(4)} ` +
+						`bases=${c.length.toString().padStart(8)} ` +
+						`GC=${c.gcPercent.toFixed(2)}%`
+				),
+			].join("\n")
+		);
+		if (genome.failures.length > 0) {
+			console.warn("Nucleotext: notes that failed to encode:", genome.failures);
+		}
+
+		// Debug summary WITHOUT raw sequences, so the file stays readable.
+		await this.writeDebugFile("genome-summary.json", {
+			generatedAt: genome.generatedAt,
+			defaultChromosome: genome.defaultChromosome,
+			totals: {
+				chromosomes: genome.chromosomes.length,
+				notes: noteCount,
+				bases: genome.length,
+				gcCount: genome.gcCount,
+				gcPercent: genome.gcPercent,
+			},
+			failures: genome.failures,
+			chromosomes: genome.chromosomes.map((c) => ({
+				name: c.name,
+				notes: c.notes.length,
+				bases: c.length,
+				gcCount: c.gcCount,
+				gcPercent: c.gcPercent,
+				records: c.notes.map((n) => ({
+					path: n.path,
+					header: n.header,
+					bases: n.length,
+					gcCount: n.gcCount,
+					gcPercent: n.gcPercent,
+				})),
+			})),
+		});
+
+		new Notice(
+			`Nucleotext: genome built — ${genome.chromosomes.length} chromosomes, ` +
+				`${noteCount} notes, GC ${genome.gcPercent}%. See console.`
+		);
+	}
+
+	/** Stage 3: export the whole genome as a single valid FASTA file. */
+	private async exportFasta(): Promise<void> {
+		const genome = await this.ensureGenome(false);
+		if (!genome) return;
+
+		const fasta = genomeToFasta(genome);
+		const noteCount = genome.chromosomes.reduce(
+			(n, c) => n + c.notes.length,
+			0
+		);
+
+		const saved = await this.saveTextWithDialog("vault-genome.fasta", fasta);
+		if (!saved) {
+			new Notice("Nucleotext: FASTA export cancelled.");
+			return;
+		}
+		new Notice(
+			`Nucleotext: exported ${noteCount} record(s) across ` +
+				`${genome.chromosomes.length} chromosome(s) to ${saved}.`
+		);
+	}
+
+	/**
+	 * Public hook for the health panel (stage 5): rebuild the genome from the
+	 * live vault so folder add/remove/rename is reflected, and return it (or null
+	 * if there's no encoder yet).
+	 */
+	async refreshGenome(): Promise<Genome | null> {
+		return this.ensureGenome(true);
+	}
+
+	/** Open (or reveal) the genome health panel in the right sidebar. */
+	private async activateHealthView(): Promise<void> {
+		const { workspace } = this.app;
+		let leaf = workspace.getLeavesOfType(GENOME_HEALTH_VIEW)[0];
+		if (!leaf) {
+			const right = workspace.getRightLeaf(false);
+			if (!right) {
+				new Notice("Nucleotext: could not open a sidebar panel.");
+				return;
+			}
+			leaf = right;
+			await leaf.setViewState({ type: GENOME_HEALTH_VIEW, active: true });
+		}
+		workspace.revealLeaf(leaf);
+	}
+
+	/**
+	 * Return a fresh genome, building it if needed. Requires an encoder mapping;
+	 * if none exists it tells the user to build one and returns null.
+	 * When `force` is true the genome is always rebuilt (used by the build
+	 * command); otherwise a cached genome is reused.
+	 */
+	private async ensureGenome(force: boolean): Promise<Genome | null> {
+		if (!this.mapping) {
+			new Notice(
+				'Nucleotext: no encoder yet. Run "Build encoder from vault" first.'
+			);
+			return null;
+		}
+		if (!force && this.genome) return this.genome;
+		this.genome = await buildGenome(
+			this.app,
+			this.mapping,
+			this.constraints(),
+			this.settings.excludedFolders
+		);
+		return this.genome;
+	}
+
+	/**
+	 * Save text to a user-chosen location via a normal save dialog. Uses the
+	 * Electron native dialog on desktop and falls back to a browser download
+	 * (e.g. on mobile, where Electron isn't available). Returns the saved path,
+	 * or null if the user cancelled.
+	 */
+	private async saveTextWithDialog(
+		defaultName: string,
+		content: string
+	): Promise<string | null> {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const req = (window as any).require?.bind(window);
+			const electron = req?.("electron");
+			const remote = electron?.remote ?? safeRequire(req, "@electron/remote");
+			const dialog = remote?.dialog ?? electron?.dialog;
+			if (dialog?.showSaveDialog && req) {
+				const result = await dialog.showSaveDialog({
+					title: "Export genome as FASTA",
+					defaultPath: defaultName,
+					filters: [
+						{ name: "FASTA", extensions: ["fasta", "fa", "fna"] },
+						{ name: "All files", extensions: ["*"] },
+					],
+				});
+				if (result.canceled || !result.filePath) return null;
+				const fs = req("fs");
+				fs.writeFileSync(result.filePath, content, "utf8");
+				return result.filePath;
+			}
+		} catch (e) {
+			console.warn(
+				"Nucleotext: native save dialog unavailable, falling back to download:",
+				e
+			);
+		}
+		// Fallback: trigger a browser download.
+		const blob = new Blob([content], { type: "text/plain" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = defaultName;
+		a.click();
+		URL.revokeObjectURL(url);
+		return defaultName;
 	}
 
 	// --- shared --------------------------------------------------------------
